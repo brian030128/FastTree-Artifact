@@ -64,7 +64,6 @@ def create_random_imbalanced_tree(batch_size=8, min_tokens=20, max_tokens=150,
 
     tree_info = []
     node_id = 0
-    leaves_created = 0
 
     # Create root
     root = KVTreeNode()
@@ -76,33 +75,23 @@ def create_random_imbalanced_tree(batch_size=8, min_tokens=20, max_tokens=150,
     tree_info.append(root)
     node_id += 1
 
-    # Queue of nodes that need children: (node_id, depth)
-    nodes_to_expand = [(0, 0)]
+    # Build tree top-down, ensuring we get exactly batch_size leaves
+    # Start with root as the only "potential parent"
+    potential_parents = [0]  # IDs of nodes that can have children
+    leaves_needed = batch_size
 
-    # Keep track of leaf nodes
-    leaf_nodes = []
+    while leaves_needed > 0 and potential_parents:
+        # Pick a random parent to expand
+        parent_idx = random.randint(0, len(potential_parents) - 1)
+        parent_id = potential_parents.pop(parent_idx)
 
-    while leaves_created < batch_size:
-        if not nodes_to_expand:
-            # No more nodes to expand, but need more leaves
-            # Pick a random leaf and make it internal
-            if leaf_nodes:
-                parent_id = random.choice(leaf_nodes)
-                leaf_nodes.remove(parent_id)
-                nodes_to_expand.append((parent_id, -1))  # Depth doesn't matter here
-            else:
-                break
-
-        parent_id, depth = nodes_to_expand.pop(0)
-
-        # Decide how many children this node should have
-        # Bias towards fewer children as we approach the target
-        remaining = batch_size - leaves_created
-        if remaining <= 1:
+        # Decide how many children (at least enough to meet quota)
+        if leaves_needed == 1:
             num_children = 1
         else:
-            # Random number of children, but not more than remaining leaves needed
-            num_children = random.randint(min_children, min(max_children, remaining))
+            # Random, but ensure we don't create too few or too many
+            max_children_now = min(max_children, leaves_needed)
+            num_children = random.randint(min_children, max_children_now)
 
         tree_info[parent_id].num_children = num_children
 
@@ -116,57 +105,70 @@ def create_random_imbalanced_tree(batch_size=8, min_tokens=20, max_tokens=150,
             child.requests = []  # Will be filled later
             tree_info.append(child)
 
-            # Decide if this child should be a leaf or have children
-            # Use probability that decreases with depth to avoid too deep trees
-            remaining_after_this = batch_size - leaves_created - 1
-
-            if remaining_after_this <= 0:
-                # Must be a leaf (we've reached our quota)
-                leaf_nodes.append(node_id)
-                leaves_created += 1
-            else:
-                # Random decision: be a leaf or expand further
-                # Probability of being a leaf increases as we get closer to batch_size
-                leaf_probability = 0.3 + 0.5 * (leaves_created / batch_size)
-
-                # Also increase probability with depth
-                leaf_probability += depth * 0.1
-                leaf_probability = min(0.9, leaf_probability)
-
-                if random.random() < leaf_probability or depth >= 10:
-                    # Make it a leaf
-                    leaf_nodes.append(node_id)
-                    leaves_created += 1
-                else:
-                    # Will expand this node later
-                    nodes_to_expand.append((node_id, depth + 1))
+            # Decide if this should be a leaf or can be expanded further
+            # If this is the last child and we still need leaves, make some expandable
+            if leaves_needed > 1 and random.random() > 0.4:  # 60% chance to expand further
+                potential_parents.append(node_id)
+            # else it stays as a leaf
 
             node_id += 1
+            leaves_needed -= 1
+
+            if leaves_needed == 0:
+                break
 
     # Find all actual leaf nodes (num_children == 0)
     actual_leaves = [node.id for node in tree_info if node.num_children == 0]
 
-    # Ensure we have exactly batch_size leaves
-    if len(actual_leaves) < batch_size:
-        print(f"Warning: Only created {len(actual_leaves)} leaves, needed {batch_size}")
-        # Pad by duplicating some leaves
-        while len(actual_leaves) < batch_size:
-            actual_leaves.append(actual_leaves[len(actual_leaves) % len(actual_leaves)])
-    elif len(actual_leaves) > batch_size:
-        # Take first batch_size leaves
-        actual_leaves = actual_leaves[:batch_size]
+    # Verify we have exactly batch_size leaves
+    if len(actual_leaves) != batch_size:
+        print(f"Warning: Created {len(actual_leaves)} leaves, expected {batch_size}")
+        # Adjust if needed
+        if len(actual_leaves) < batch_size:
+            # Need to split some leaves into internal nodes with new children
+            while len(actual_leaves) < batch_size:
+                # Pick a leaf to expand
+                leaf_to_expand = actual_leaves[random.randint(0, len(actual_leaves) - 1)]
+                actual_leaves.remove(leaf_to_expand)
+
+                # Make it internal with 2 children (creates 1 net new leaf)
+                tree_info[leaf_to_expand].num_children = 2
+                for i in range(2):
+                    child = KVTreeNode()
+                    child.parent = leaf_to_expand
+                    child.id = node_id
+                    child.seqlen = random.randint(min_tokens, max_tokens)
+                    child.num_children = 0
+                    child.requests = []
+                    tree_info.append(child)
+                    actual_leaves.append(node_id)
+                    node_id += 1
+        else:
+            # Too many leaves, just take first batch_size
+            actual_leaves = actual_leaves[:batch_size]
 
     # Assign requests to leaf nodes
     for request_id, leaf_id in enumerate(actual_leaves):
-        tree_info[leaf_id].requests = [request_id]
+        if leaf_id < len(tree_info):
+            tree_info[leaf_id].requests = [request_id]
 
     # Propagate requests up the tree
     for leaf_id in actual_leaves:
+        if leaf_id >= len(tree_info):
+            continue
         curr_id = leaf_id
-        request_id = tree_info[leaf_id].requests[0]
-        while curr_id != -1:
+        request_id = tree_info[leaf_id].requests[0] if tree_info[leaf_id].requests else None
+        if request_id is None:
+            continue
+
+        visited = set()
+        while curr_id != -1 and curr_id is not None:
+            if curr_id in visited:
+                break
+            visited.add(curr_id)
+
             parent_id = tree_info[curr_id].parent
-            if parent_id != -1:
+            if parent_id != -1 and parent_id < len(tree_info):
                 # Add this request to parent
                 if request_id not in tree_info[parent_id].requests:
                     tree_info[parent_id].requests.append(request_id)
