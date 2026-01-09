@@ -456,11 +456,23 @@ def main():
             args.min_children, args.max_children, args.seed
         )
 
+    # Debug: Print tree structure (first few nodes)
+    print("\nDebug: First 5 nodes:")
+    for i, node in enumerate(tree_info[:5]):
+        print(f"  Node {node.id}: parent={node.parent}, seqlen={node.seqlen}, "
+              f"children={node.num_children}, requests={node.requests}")
+    print(f"  ... ({len(tree_info)} total nodes)")
+
     # Analyze tree structure
     def analyze_tree(tree_info):
         """Analyze tree characteristics"""
         num_nodes = len(tree_info)
         num_leaves = sum(1 for node in tree_info if node.num_children == 0)
+
+        # Verify node IDs match list indices
+        for i, node in enumerate(tree_info):
+            if node.id != i:
+                print(f"Warning: Node ID mismatch at index {i}: node.id={node.id}")
 
         # Calculate depths for each leaf
         leaf_depths = []
@@ -468,10 +480,18 @@ def main():
             if node.num_children == 0:
                 depth = 0
                 curr_id = node.id
-                while tree_info[curr_id].parent != -1:
+                visited = set()
+                while curr_id is not None and curr_id != -1 and tree_info[curr_id].parent != -1:
+                    if curr_id in visited:
+                        print(f"Warning: Cycle detected at node {curr_id}")
+                        break
+                    visited.add(curr_id)
                     depth += 1
                     curr_id = tree_info[curr_id].parent
                 leaf_depths.append(depth)
+
+        if not leaf_depths:
+            leaf_depths = [0]
 
         # Calculate path lengths (tokens) for each request
         path_lengths = []
@@ -483,23 +503,31 @@ def main():
                     leaf_id = node.id
                     break
 
+            if leaf_id is None:
+                print(f"Warning: Could not find leaf for request {req_id}")
+                continue
+
             # Sum tokens along path
             total_tokens = 0
             curr_id = leaf_id
-            while curr_id != -1:
+            while curr_id is not None and curr_id != -1:
                 total_tokens += tree_info[curr_id].seqlen
                 curr_id = tree_info[curr_id].parent
             path_lengths.append(total_tokens)
 
+        if not path_lengths:
+            # Fallback if no paths found
+            path_lengths = [0]
+
         return {
             'num_nodes': num_nodes,
             'num_leaves': num_leaves,
-            'min_depth': min(leaf_depths),
-            'max_depth': max(leaf_depths),
-            'avg_depth': sum(leaf_depths) / len(leaf_depths),
-            'min_path_len': min(path_lengths),
-            'max_path_len': max(path_lengths),
-            'avg_path_len': sum(path_lengths) / len(path_lengths),
+            'min_depth': min(leaf_depths) if leaf_depths else 0,
+            'max_depth': max(leaf_depths) if leaf_depths else 0,
+            'avg_depth': sum(leaf_depths) / len(leaf_depths) if leaf_depths else 0,
+            'min_path_len': min(path_lengths) if path_lengths else 0,
+            'max_path_len': max(path_lengths) if path_lengths else 0,
+            'avg_path_len': sum(path_lengths) / len(path_lengths) if path_lengths else 0,
         }
 
     stats = analyze_tree(tree_info)
