@@ -1,17 +1,19 @@
 """
-FastTree with Paged KV Cache
+FastTree with Paged KV Cache (SGLang-style)
 
 This example demonstrates how to use FastTree with paged KV cache,
-which is the typical format used in production LLM inference systems
-like SGLang, vLLM, etc.
+following the same pattern as SGLang's integration. The key insight is
+that FastTree uses indirect indexing via a page table (req_to_token),
+so there's NO need to gather/copy KV values.
 
-Paged KV cache format:
+The kernel accesses KV via double indirection:
+    1. vnode_to_kv_offs gives offset into req_to_token (page table)
+    2. req_to_token[offset] gives the actual slot index in the KV buffer
+    3. K[slot_index], V[slot_index] are the actual KV values
+
+Paged KV cache format (SGLang-style):
     kv_cache[layer]: (max_num_pages, 2, page_size, num_kv_heads, head_dim)
-    - Dimension 0: page index
-    - Dimension 1: K=0, V=1
-    - Dimension 2: token position within page
-    - Dimension 3: KV head index
-    - Dimension 4: head dimension
+    Flattened to: (total_slots, num_kv_heads, head_dim) for kernel access
 
 Usage:
     python 03_paged_kv_cache.py --batch_size 8
@@ -26,16 +28,29 @@ import torch
 import torch.nn.functional as F
 import argparse
 from typing import List, Tuple, Dict
-from fasttree import FastTreeParams, fasttree_preparation, fasttree_decode
+from dataclasses import dataclass
 from kv_tree_simple import KVTreeNode
 
+# Import the SGLang-style kernel that supports indirect indexing
+from fasttree_sglang_plugin import FastTreeMetadata, fasttree_decode
 
-class PagedKVCache:
+
+@dataclass
+class PageInfo:
+    """Tracks page allocation for a tree node."""
+    page_indices: List[int]  # Which pages this node uses
+    start_slot: int          # First slot index in the flattened buffer
+    num_tokens: int          # Number of tokens in this node
+
+
+class PagedKVCacheManager:
     """
-    Manages paged KV cache for tree-structured attention.
+    Manages paged KV cache with page table for indirect access.
     
-    Each tree node's KV data is stored in one or more pages.
-    Page table tracks which pages belong to which nodes.
+    This follows SGLang's approach where:
+    - KV data is stored in pages: (max_pages, 2, page_size, num_heads, head_dim)
+    - A page table (req_to_token) maps logical positions to physical slots
+    - The kernel uses indirect indexing through the page table
     """
     
     def __init__(
@@ -44,7 +59,6 @@ class PagedKVCache:
         page_size: int,
         num_kv_heads: int,
         head_dim: int,
-        layer_num: int = 1,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
     ):
@@ -52,108 +66,118 @@ class PagedKVCache:
         self.page_size = page_size
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
-        self.layer_num = layer_num
         self.device = device
         self.dtype = dtype
+        self.total_slots = max_num_pages * page_size
         
-        # Paged KV cache: (max_num_pages, 2, page_size, num_kv_heads, head_dim)
-        # 2 = [K, V]
-        self.kv_cache_at_layer: List[torch.Tensor] = [
-            torch.zeros(
-                (max_num_pages, 2, page_size, num_kv_heads, head_dim),
-                dtype=dtype,
-                device=device,
-            )
-            for _ in range(layer_num)
-        ]
+        # Paged KV cache: (total_slots, num_kv_heads, head_dim)
+        # This is the flattened view that the kernel accesses
+        self.k_buffer = torch.zeros(
+            (self.total_slots, num_kv_heads, head_dim),
+            dtype=dtype, device=device
+        )
+        self.v_buffer = torch.zeros(
+            (self.total_slots, num_kv_heads, head_dim),
+            dtype=dtype, device=device
+        )
         
-        # Page allocation tracking
+        # Page allocation
         self.free_pages: List[int] = list(range(max_num_pages))
-        self.allocated_pages: Dict[int, List[int]] = {}  # node_id -> list of page indices
+        self.node_pages: Dict[int, PageInfo] = {}
         
-        # For each node, track (start_page_idx, num_pages, tokens_in_last_page)
-        self.node_page_info: Dict[int, Tuple[int, int, int]] = {}
+        # Page table: maps (request_idx, token_position) -> slot_index
+        # In SGLang this is req_to_token_pool.req_to_token
+        # Shape: (max_requests, max_seq_len) - we'll use a simpler version
+        self.max_seq_len = max_num_pages * page_size
         
-    def allocate_pages_for_node(self, node_id: int, num_tokens: int) -> List[int]:
-        """Allocate pages for a tree node."""
-        num_pages_needed = (num_tokens + self.page_size - 1) // self.page_size
+    def allocate_for_node(self, node_id: int, num_tokens: int) -> PageInfo:
+        """Allocate pages for a tree node and return page info."""
+        num_pages = (num_tokens + self.page_size - 1) // self.page_size
         
-        if len(self.free_pages) < num_pages_needed:
-            raise RuntimeError(f"Not enough free pages. Need {num_pages_needed}, have {len(self.free_pages)}")
+        if len(self.free_pages) < num_pages:
+            raise RuntimeError(f"Out of pages: need {num_pages}, have {len(self.free_pages)}")
         
-        pages = [self.free_pages.pop(0) for _ in range(num_pages_needed)]
-        self.allocated_pages[node_id] = pages
+        pages = [self.free_pages.pop(0) for _ in range(num_pages)]
+        start_slot = pages[0] * self.page_size
         
-        tokens_in_last_page = num_tokens % self.page_size
-        if tokens_in_last_page == 0:
-            tokens_in_last_page = self.page_size
-        self.node_page_info[node_id] = (pages[0], len(pages), tokens_in_last_page)
-        
-        return pages
+        info = PageInfo(
+            page_indices=pages,
+            start_slot=start_slot,
+            num_tokens=num_tokens
+        )
+        self.node_pages[node_id] = info
+        return info
     
-    def store_kv(self, node_id: int, k_data: torch.Tensor, v_data: torch.Tensor, layer: int = 0):
+    def store_kv(self, node_id: int, k: torch.Tensor, v: torch.Tensor):
         """
-        Store K and V data for a node into paged cache.
+        Store K/V data for a node.
         
         Args:
-            node_id: Tree node ID
-            k_data: Key tensor of shape (seqlen, num_kv_heads, head_dim)
-            v_data: Value tensor of shape (seqlen, num_kv_heads, head_dim)
-            layer: Layer index
+            k, v: (num_tokens, num_kv_heads, head_dim)
         """
-        seqlen = k_data.shape[0]
-        pages = self.allocated_pages.get(node_id)
+        info = self.node_pages.get(node_id)
+        if info is None:
+            info = self.allocate_for_node(node_id, k.shape[0])
         
-        if pages is None:
-            pages = self.allocate_pages_for_node(node_id, seqlen)
-        
-        # Store tokens into pages
+        # Store tokens into their page slots
         token_idx = 0
-        for page_idx in pages:
-            tokens_in_page = min(self.page_size, seqlen - token_idx)
-            self.kv_cache_at_layer[layer][page_idx, 0, :tokens_in_page] = k_data[token_idx:token_idx + tokens_in_page]
-            self.kv_cache_at_layer[layer][page_idx, 1, :tokens_in_page] = v_data[token_idx:token_idx + tokens_in_page]
-            token_idx += tokens_in_page
+        for page_idx in info.page_indices:
+            slot_start = page_idx * self.page_size
+            tokens_to_store = min(self.page_size, info.num_tokens - token_idx)
+            
+            self.k_buffer[slot_start:slot_start + tokens_to_store] = k[token_idx:token_idx + tokens_to_store]
+            self.v_buffer[slot_start:slot_start + tokens_to_store] = v[token_idx:token_idx + tokens_to_store]
+            token_idx += tokens_to_store
     
-    def get_kv_indices_for_node(self, node_id: int) -> List[int]:
+    def build_req_to_token(self, tree_info: List[KVTreeNode], batch_size: int) -> torch.Tensor:
         """
-        Get flat token indices for a node to use with FastTree.
+        Build the page table (req_to_token) for all requests.
         
-        Returns indices into a flattened view of the paged cache.
+        This maps each (request, token_position) to its slot in the KV buffer.
+        Following SGLang's pattern where req_to_token[req_idx * stride + pos] = slot_idx.
         """
-        pages = self.allocated_pages.get(node_id, [])
-        if not pages:
-            return []
+        # Find max sequence length (path from root to leaf)
+        max_seqlen = 0
+        for node in tree_info:
+            if node.num_children == 0:  # Leaf
+                seqlen = 0
+                curr = node.id
+                while curr != -1:
+                    seqlen += tree_info[curr].seqlen
+                    curr = tree_info[curr].parent
+                max_seqlen = max(max_seqlen, seqlen)
         
-        indices = []
-        start_page, num_pages, tokens_in_last = self.node_page_info[node_id]
+        # Build page table: (batch_size, max_seqlen)
+        req_to_token = torch.zeros(
+            (batch_size, max_seqlen), dtype=torch.int32, device=self.device
+        )
         
-        for i, page_idx in enumerate(pages):
-            if i < num_pages - 1:
-                # Full page
-                for t in range(self.page_size):
-                    indices.append(page_idx * self.page_size + t)
-            else:
-                # Last page (may be partial)
-                for t in range(tokens_in_last):
-                    indices.append(page_idx * self.page_size + t)
+        # For each request, trace path from root to leaf and fill in slot indices
+        for node in tree_info:
+            if node.num_children == 0 and node.requests:  # Leaf with requests
+                req_id = node.requests[0]
+                
+                # Collect path from root to this leaf
+                path = []
+                curr = node.id
+                while curr != -1:
+                    path.append(curr)
+                    curr = tree_info[curr].parent
+                path = path[::-1]  # Root to leaf
+                
+                # Fill in slot indices for each token position
+                pos = 0
+                for node_id in path:
+                    info = self.node_pages[node_id]
+                    for i in range(info.num_tokens):
+                        # Calculate slot index for this token
+                        page_idx = info.page_indices[i // self.page_size]
+                        slot_within_page = i % self.page_size
+                        slot_idx = page_idx * self.page_size + slot_within_page
+                        req_to_token[req_id, pos] = slot_idx
+                        pos += 1
         
-        return indices
-    
-    def get_flattened_kv(self, layer: int = 0) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Get flattened K and V tensors for FastTree kernel.
-        
-        Returns:
-            K: (total_tokens, num_kv_heads, head_dim)
-            V: (total_tokens, num_kv_heads, head_dim)
-        """
-        cache = self.kv_cache_at_layer[layer]
-        # Reshape from (pages, 2, page_size, heads, dim) to (pages * page_size, 2, heads, dim)
-        total_slots = self.max_num_pages * self.page_size
-        K = cache[:, 0].reshape(total_slots, self.num_kv_heads, self.head_dim)
-        V = cache[:, 1].reshape(total_slots, self.num_kv_heads, self.head_dim)
-        return K, V
+        return req_to_token
 
 
 def create_random_tree(batch_size: int, min_tokens: int = 20, max_tokens: int = 100, seed: int = 42):
@@ -170,11 +194,11 @@ def create_random_tree(batch_size: int, min_tokens: int = 20, max_tokens: int = 
     root.id = node_id
     root.seqlen = random.randint(min_tokens, max_tokens)
     root.num_children = 0
-    root.requests = []
+    root.requests = list(range(batch_size))  # All requests go through root
     tree_info.append(root)
     node_id += 1
     
-    # Build tree to get batch_size leaves
+    # Build tree
     potential_parents = [0]
     leaves_created = 0
     
@@ -198,86 +222,242 @@ def create_random_tree(batch_size: int, min_tokens: int = 20, max_tokens: int = 
             child.requests = []
             tree_info.append(child)
             
-            # Decide if this becomes an internal node or leaf
             if leaves_created + len(potential_parents) + 1 < batch_size and random.random() > 0.5:
                 potential_parents.append(node_id)
             else:
                 leaves_created += 1
             
             node_id += 1
-            
             if leaves_created >= batch_size:
                 break
     
-    # Assign requests to leaf nodes
+    # Assign requests to leaves and propagate up
     leaves = [n for n in tree_info if n.num_children == 0]
     for req_id, leaf in enumerate(leaves[:batch_size]):
         leaf.requests = [req_id]
         
-        # Propagate up
+        # Propagate request assignment up
         curr = leaf.parent
         while curr != -1:
             if req_id not in tree_info[curr].requests:
                 tree_info[curr].requests.append(req_id)
             curr = tree_info[curr].parent
     
+    # Sort requests for consistency
+    for node in tree_info:
+        node.requests.sort()
+    
     return tree_info
 
 
-def prepare_paged_kv_for_tree(
+def prepare_fasttree_metadata_for_paged_cache(
     tree_info: List[KVTreeNode],
-    paged_cache: PagedKVCache,
-    layer: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+    req_to_token: torch.Tensor,
+    batch_size: int,
+    num_qo_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    device: str = "cuda",
+) -> FastTreeMetadata:
     """
-    Prepare paged KV cache for a tree structure.
+    Prepare FastTree metadata using paged KV cache (page table approach).
     
-    Allocates pages and fills with random data for each node.
-    Returns flattened K, V tensors and KV_ptrs for FastTree.
+    The key difference from contiguous KV:
+    - vnode_to_kv_offs are offsets into req_to_token (page table)
+    - The kernel uses req_to_token[offset] to get actual KV slot indices
     """
-    device = paged_cache.device
-    dtype = paged_cache.dtype
+    import queue
     
-    # Allocate pages and store random KV data for each node
-    for node in tree_info:
-        seqlen = node.seqlen
-        k_data = torch.randn(seqlen, paged_cache.num_kv_heads, paged_cache.head_dim, 
-                            device=device, dtype=dtype)
-        v_data = torch.randn(seqlen, paged_cache.num_kv_heads, paged_cache.head_dim,
-                            device=device, dtype=dtype)
-        paged_cache.store_kv(node.id, k_data, v_data, layer)
+    metadata = FastTreeMetadata(
+        num_qo_heads=num_qo_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        device=device,
+    )
     
-    # Build KV_ptrs - cumulative token counts per node
-    KV_ptrs = [0]
-    for node in tree_info:
-        KV_ptrs.append(KV_ptrs[-1] + node.seqlen)
+    # Cost model parameters
+    alpha, beta, gamma = metadata.alpha, metadata.beta, metadata.gamma
+    kv_group_num = num_qo_heads // num_kv_heads
+    phase_q_tile_sizes = list(metadata.TSQs)
+    phase_kv_tile_sizes = list(metadata.TSKs)
+    phase_kv_split_sizes = [metadata.kv_split_sizes[0], metadata.kv_split_sizes[0]]
     
-    # Get flattened KV for the kernel
-    K, V = paged_cache.get_flattened_kv(layer)
+    def CpadQ(TS, N):
+        return TS - ((N - 1) % TS + 1)
     
-    return K, V, KV_ptrs
-
-
-def build_kv_indices_for_fasttree(
-    tree_info: List[KVTreeNode],
-    paged_cache: PagedKVCache,
-) -> torch.Tensor:
-    """
-    Build the KV index mapping for FastTree to access paged cache.
+    def CpadK(TS, N):
+        return max(0, TS - N)
     
-    FastTree needs indices into the flattened KV buffer.
-    With paged cache, we need to map node tokens to their page locations.
-    """
-    all_indices = []
-    for node in tree_info:
-        indices = paged_cache.get_kv_indices_for_node(node.id)
-        all_indices.extend(indices)
+    def Cmm(nQ, nK):
+        phase = 0 if nQ > phase_q_tile_sizes[1] else 1
+        TSQ = phase_q_tile_sizes[phase]
+        TSK = phase_kv_tile_sizes[phase]
+        return alpha * CpadQ(TSQ, nQ) * kv_group_num * nK + beta * CpadK(TSK, nK) * nQ * kv_group_num
     
-    return torch.tensor(all_indices, dtype=torch.int32, device=paged_cache.device)
+    def SplitQCost(nQcurr, nQl, lenv, lenl):
+        return Cmm(nQcurr - nQl, lenv) + Cmm(nQl, lenl + lenv)
+    
+    def SplitKCost(nQcurr, nQl, lenl, lenv):
+        return Cmm(nQcurr, lenv) + Cmm(nQl, lenl) + gamma * nQl
+    
+    # BFS traversal to compute node assignments
+    node_num = len(tree_info)
+    edges = [[] for _ in range(node_num)]
+    for i in range(node_num):
+        if tree_info[i].parent != -1:
+            edges[tree_info[i].parent].append(i)
+    
+    L = [tree_info[i].seqlen for i in range(node_num)]
+    node_assignments = [0] * node_num
+    
+    # Heuristic: decide split strategy per edge
+    que = queue.Queue()
+    que.put(0)
+    while not que.empty():
+        node = que.get()
+        nQcurr = len(tree_info[node].requests)
+        lenv = L[node]
+        
+        for child in edges[node]:
+            nQl = len(tree_info[child].requests)
+            lenl = L[child]
+            C0 = SplitKCost(nQcurr, nQl, lenl, lenv)
+            C1 = SplitQCost(nQcurr, nQl, lenv, lenl)
+            if C0 > C1:
+                node_assignments[child] = 1  # Merge with parent
+                nQcurr -= nQl
+                L[child] = lenl + lenv
+            else:
+                node_assignments[child] = 0  # Split
+            que.put(child)
+    
+    # Compute which requests each node handles after merging
+    node_to_reqs = [[] for _ in range(node_num)]
+    que = queue.Queue()
+    for i in range(node_num):
+        if tree_info[i].num_children == 0:
+            que.put(i)
+            node_to_reqs[i] = tree_info[i].requests.copy()
+    
+    virtual_children = [tree_info[n].num_children for n in range(node_num)]
+    while not que.empty():
+        node = que.get()
+        if node_assignments[node] == 0 and node != 0:
+            node_to_reqs[tree_info[node].parent] += tree_info[node].requests
+        virtual_children[tree_info[node].parent] -= 1
+        if tree_info[node].parent >= 0 and virtual_children[tree_info[node].parent] == 0:
+            que.put(tree_info[node].parent)
+    
+    # Build vnode metadata
+    # Key: vnode_to_kv_offs are offsets into req_to_token (the page table)
+    vnode_to_kv_offs = []
+    vnode_to_kv_lens = []
+    vnode_to_q_entries = []
+    vnode_to_q_offs = []
+    vnode_to_q_lens = []
+    req_to_vnode_entries = [[] for _ in range(batch_size)]
+    
+    req_to_token_stride = req_to_token.stride(0)
+    
+    # Compute token offsets for each node (position in the sequence)
+    node_token_offsets = [0] * node_num
+    for i in range(1, node_num):
+        parent = tree_info[i].parent
+        # Token offset = parent's offset + parent's tokens
+        node_token_offsets[i] = node_token_offsets[parent] + tree_info[parent].seqlen
+    
+    for i in range(node_num):
+        req_num = len(node_to_reqs[i])
+        if req_num == 0:
+            continue
+        
+        # Compute merged KV length
+        kv_len = tree_info[i].seqlen
+        node = i
+        while node_assignments[node] == 1:
+            node = tree_info[node].parent
+            kv_len += tree_info[node].seqlen
+        
+        phase = 0 if req_num > phase_q_tile_sizes[1] else 1
+        kv_split_size = phase_kv_split_sizes[phase]
+        q_split_size = phase_q_tile_sizes[phase]
+        
+        # Get first request to find the page table row
+        first_req = node_to_reqs[i][0]
+        token_offset = node_token_offsets[node]  # Use merged node's offset
+        
+        # KV offset is into the page table (req_to_token)
+        kv_offset_start = req_to_token_stride * first_req + token_offset
+        
+        kv_split_count = (kv_len - 1) // kv_split_size + 1
+        q_split_count = (req_num - 1) // q_split_size + 1
+        
+        for kv_split_id in range(kv_split_count):
+            q_offset_start = len(vnode_to_q_entries)
+            for req in node_to_reqs[i]:
+                vnode_to_q_entries.append(req)
+            
+            split_kv_off = kv_split_id * kv_split_size
+            vnode_kv_len = min(split_kv_off + kv_split_size, kv_len) - split_kv_off
+            
+            for q_split_id in range(q_split_count):
+                split_q_off = q_split_id * q_split_size
+                vnode_q_len = min(split_q_off + q_split_size, req_num) - split_q_off
+                
+                vnode_to_kv_offs.append(kv_offset_start + split_kv_off)
+                vnode_to_kv_lens.append(vnode_kv_len)
+                vnode_to_q_offs.append(q_offset_start + split_q_off)
+                vnode_to_q_lens.append(vnode_q_len)
+    
+    # Build req_to_vnode mapping
+    for i, req in enumerate(vnode_to_q_entries):
+        req_to_vnode_entries[req].append(i)
+    
+    req_to_vnode_offs = []
+    req_to_vnode_lens = []
+    offset = 0
+    for i in range(batch_size):
+        req_to_vnode_offs.append(offset)
+        offset += len(req_to_vnode_entries[i])
+        req_to_vnode_lens.append(len(req_to_vnode_entries[i]))
+    
+    req_to_vnode_entries_flat = [item for sublist in req_to_vnode_entries for item in sublist]
+    
+    # Reorder vnodes by phase
+    threshold = phase_q_tile_sizes[1]
+    above_indices = [i for i, val in enumerate(vnode_to_q_lens) if val > threshold]
+    below_indices = [i for i, val in enumerate(vnode_to_q_lens) if val <= threshold]
+    new_order = above_indices + below_indices
+    
+    metadata.phase_node_nums = (len(above_indices), len(below_indices))
+    metadata.phase_node_offsets = (0, len(above_indices))
+    metadata.phase_q_tile_sizes = tuple(phase_q_tile_sizes)
+    metadata.phase_kv_tile_sizes = tuple(phase_kv_tile_sizes)
+    
+    vnode_to_q_lens = [vnode_to_q_lens[i] for i in new_order]
+    vnode_to_q_offs = [vnode_to_q_offs[i] for i in new_order]
+    vnode_to_kv_lens = [vnode_to_kv_lens[i] for i in new_order]
+    vnode_to_kv_offs = [vnode_to_kv_offs[i] for i in new_order]
+    
+    # Copy to GPU
+    def to_gpu(preallocated, data):
+        t = torch.tensor(data, dtype=torch.int32, device="cpu")
+        preallocated[:len(data)].copy_(t, non_blocking=True)
+    
+    to_gpu(metadata.vnode_to_q_entries, vnode_to_q_entries)
+    to_gpu(metadata.vnode_to_q_offs, vnode_to_q_offs)
+    to_gpu(metadata.vnode_to_q_lens, vnode_to_q_lens)
+    to_gpu(metadata.vnode_to_kv_offs, vnode_to_kv_offs)
+    to_gpu(metadata.vnode_to_kv_lens, vnode_to_kv_lens)
+    to_gpu(metadata.req_to_vnode_entries, req_to_vnode_entries_flat)
+    to_gpu(metadata.req_to_vnode_offs, req_to_vnode_offs)
+    to_gpu(metadata.req_to_vnode_lens, req_to_vnode_lens)
+    
+    return metadata
 
 
 def pytorch_attention_reference(Q, K_list, V_list, sm_scale, num_qo_heads, num_kv_heads):
-    """Reference implementation using PyTorch for validation."""
+    """Reference implementation for validation."""
     batch_size = Q.shape[0]
     head_dim = Q.shape[-1]
     gqa_ratio = num_qo_heads // num_kv_heads
@@ -285,43 +465,35 @@ def pytorch_attention_reference(Q, K_list, V_list, sm_scale, num_qo_heads, num_k
     O = torch.zeros_like(Q)
     
     for b in range(batch_size):
-        K = K_list[b]  # (seqlen, num_kv_heads, head_dim)
+        K = K_list[b]
         V = V_list[b]
-        q = Q[b]  # (num_qo_heads, head_dim)
-        
-        seqlen = K.shape[0]
+        q = Q[b]
         
         for h in range(num_qo_heads):
             kv_h = h // gqa_ratio
-            q_h = q[h]  # (head_dim,)
-            k_h = K[:, kv_h]  # (seqlen, head_dim)
-            v_h = V[:, kv_h]  # (seqlen, head_dim)
-            
-            # Attention scores
-            scores = torch.matmul(q_h.unsqueeze(0), k_h.T) * sm_scale  # (1, seqlen)
-            attn_weights = F.softmax(scores, dim=-1)  # (1, seqlen)
-            out = torch.matmul(attn_weights, v_h)  # (1, head_dim)
-            O[b, h] = out.squeeze(0)
+            scores = torch.matmul(q[h].unsqueeze(0), K[:, kv_h].T) * sm_scale
+            attn_weights = F.softmax(scores, dim=-1)
+            O[b, h] = torch.matmul(attn_weights, V[:, kv_h]).squeeze(0)
     
     return O
 
 
 def main():
-    parser = argparse.ArgumentParser(description='FastTree with Paged KV Cache Example')
-    parser.add_argument('--batch_size', type=int, default=8, help='Number of requests (leaf nodes)')
-    parser.add_argument('--page_size', type=int, default=16, help='Tokens per page')
-    parser.add_argument('--max_num_pages', type=int, default=1024, help='Maximum number of pages')
-    parser.add_argument('--num_qo_heads', type=int, default=32, help='Number of Q/O heads')
-    parser.add_argument('--num_kv_heads', type=int, default=32, help='Number of K/V heads')
-    parser.add_argument('--head_dim', type=int, default=128, help='Head dimension')
-    parser.add_argument('--min_tokens', type=int, default=20, help='Min tokens per node')
-    parser.add_argument('--max_tokens', type=int, default=100, help='Max tokens per node')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--validate', action='store_true', help='Validate against PyTorch')
+    parser = argparse.ArgumentParser(description='FastTree with Paged KV Cache (SGLang-style)')
+    parser.add_argument('--batch_size', type=int, default=8)
+    parser.add_argument('--page_size', type=int, default=16)
+    parser.add_argument('--max_num_pages', type=int, default=1024)
+    parser.add_argument('--num_qo_heads', type=int, default=32)
+    parser.add_argument('--num_kv_heads', type=int, default=32)
+    parser.add_argument('--head_dim', type=int, default=128)
+    parser.add_argument('--min_tokens', type=int, default=20)
+    parser.add_argument('--max_tokens', type=int, default=100)
+    parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--validate', action='store_true')
     args = parser.parse_args()
     
     print("=" * 70)
-    print("FastTree with Paged KV Cache Example")
+    print("FastTree with Paged KV Cache (SGLang-style, No Copy)")
     print("=" * 70)
     
     device = "cuda"
@@ -331,118 +503,77 @@ def main():
     print(f"  Batch size: {args.batch_size}")
     print(f"  Page size: {args.page_size}")
     print(f"  Max pages: {args.max_num_pages}")
-    print(f"  Q/O heads: {args.num_qo_heads}")
-    print(f"  K/V heads: {args.num_kv_heads}")
-    print(f"  Head dim: {args.head_dim}")
+    print(f"  Heads: Q/O={args.num_qo_heads}, K/V={args.num_kv_heads}")
     print(f"  GQA ratio: {args.num_qo_heads // args.num_kv_heads}")
     
-    # ============================================================
-    # Create Tree Structure
-    # ============================================================
-    print(f"\nCreating random tree with {args.batch_size} requests...")
-    tree_info = create_random_tree(
-        args.batch_size, args.min_tokens, args.max_tokens, args.seed
-    )
+    # Create tree
+    print(f"\nCreating tree structure...")
+    tree_info = create_random_tree(args.batch_size, args.min_tokens, args.max_tokens, args.seed)
     
     num_nodes = len(tree_info)
     total_tokens = sum(n.seqlen for n in tree_info)
-    num_leaves = sum(1 for n in tree_info if n.num_children == 0)
+    print(f"  Nodes: {num_nodes}, Tokens: {total_tokens}")
     
-    print(f"  Total nodes: {num_nodes}")
-    print(f"  Leaf nodes: {num_leaves}")
-    print(f"  Total tokens: {total_tokens}")
-    
-    # ============================================================
-    # Initialize Paged KV Cache
-    # ============================================================
+    # Initialize paged KV cache
     print(f"\nInitializing paged KV cache...")
-    paged_cache = PagedKVCache(
-        max_num_pages=args.max_num_pages,
-        page_size=args.page_size,
-        num_kv_heads=args.num_kv_heads,
-        head_dim=args.head_dim,
-        layer_num=1,
-        device=device,
-        dtype=dtype,
+    cache = PagedKVCacheManager(
+        args.max_num_pages, args.page_size,
+        args.num_kv_heads, args.head_dim,
+        device, dtype
     )
     
-    pages_needed = (total_tokens + args.page_size - 1) // args.page_size
-    print(f"  Pages needed: ~{pages_needed}")
-    print(f"  Cache size: {paged_cache.kv_cache_at_layer[0].numel() * 2 / 1e6:.1f} MB")
-    
-    # ============================================================
-    # Prepare KV Data in Paged Cache
-    # ============================================================
-    print(f"\nPreparing KV data in paged cache...")
-    
-    # Store random K/V data for each tree node
-    K_node_list = []  # For validation
-    V_node_list = []
-    
+    # Store KV data for each node (for validation we keep references)
+    K_node_data = []
+    V_node_data = []
     for node in tree_info:
-        seqlen = node.seqlen
-        k_data = torch.randn(seqlen, args.num_kv_heads, args.head_dim, device=device, dtype=dtype)
-        v_data = torch.randn(seqlen, args.num_kv_heads, args.head_dim, device=device, dtype=dtype)
-        paged_cache.store_kv(node.id, k_data, v_data, layer=0)
-        K_node_list.append(k_data)
-        V_node_list.append(v_data)
+        k = torch.randn(node.seqlen, args.num_kv_heads, args.head_dim, device=device, dtype=dtype)
+        v = torch.randn(node.seqlen, args.num_kv_heads, args.head_dim, device=device, dtype=dtype)
+        cache.store_kv(node.id, k, v)
+        K_node_data.append(k)
+        V_node_data.append(v)
     
-    # Get flattened KV tensors
-    K_flat, V_flat = paged_cache.get_flattened_kv(layer=0)
-    print(f"  Flattened K shape: {K_flat.shape}")
-    print(f"  Flattened V shape: {V_flat.shape}")
+    # Build page table
+    print(f"  Building page table (req_to_token)...")
+    req_to_token = cache.build_req_to_token(tree_info, args.batch_size)
+    print(f"  Page table shape: {req_to_token.shape}")
     
-    # Build KV_ptrs using paged indices
-    # FastTree expects contiguous indices, but with paged cache we need to remap
-    # Solution: Build a contiguous K/V buffer with proper indexing
+    # Prepare FastTree metadata
+    print(f"\nPreparing FastTree metadata...")
+    metadata = prepare_fasttree_metadata_for_paged_cache(
+        tree_info, req_to_token, args.batch_size,
+        args.num_qo_heads, args.num_kv_heads, args.head_dim, device
+    )
     
-    # For paged cache, we need to gather tokens in order for each node
-    kv_entries = []
-    KV_ptrs = [0]
-    for node in tree_info:
-        indices = paged_cache.get_kv_indices_for_node(node.id)
-        kv_entries.extend(indices)
-        KV_ptrs.append(len(kv_entries))
-    
-    kv_entries_tensor = torch.tensor(kv_entries, dtype=torch.int64, device=device)
-    
-    # Gather K/V using the paged indices
-    K_tree = K_flat[kv_entries_tensor]  # (total_tokens, num_kv_heads, head_dim)
-    V_tree = V_flat[kv_entries_tensor]
-    
-    print(f"  K_tree shape: {K_tree.shape}")
-    print(f"  V_tree shape: {V_tree.shape}")
-    
-    # ============================================================
-    # Create Query Tensor
-    # ============================================================
+    # Create query
     Q = torch.randn(args.batch_size, args.num_qo_heads, args.head_dim, device=device, dtype=dtype)
-    
-    # ============================================================
-    # Run FastTree
-    # ============================================================
-    print(f"\n{'='*70}")
-    print("Running FastTree...")
-    print(f"{'='*70}")
-    
-    params = FastTreeParams()
-    params.set_kv_group_num(args.num_qo_heads // args.num_kv_heads)
-    
-    metadata, node_assignments = fasttree_preparation(
-        tree_info, KV_ptrs, args.batch_size,
-        args.num_qo_heads, args.num_kv_heads, args.head_dim,
-        [1024, 128], [132, 528], [132, 132], params
-    )
-    
-    O_fasttree = torch.empty(args.batch_size, args.num_qo_heads, args.head_dim, 
-                             device=device, dtype=dtype)
+    O = torch.empty_like(Q)
     sm_scale = 1.0 / (args.head_dim ** 0.5)
+    
+    # Run FastTree with paged KV (no copy!)
+    print(f"\n{'='*70}")
+    print("Running FastTree with paged KV cache (indirect indexing)...")
+    print(f"{'='*70}")
     
     # Warmup
     for _ in range(3):
         fasttree_decode(
-            Q, K_tree, V_tree, O_fasttree, *metadata,
-            params.TSQs, params.TSKs, sm_scale
+            Q, cache.k_buffer, cache.v_buffer, O,
+            req_to_token,  # Page table for indirect indexing
+            metadata.vnode_to_kv_offs,
+            metadata.vnode_to_kv_lens,
+            metadata.vnode_to_q_entries,
+            metadata.vnode_to_q_offs,
+            metadata.vnode_to_q_lens,
+            metadata.req_to_vnode_entries,
+            metadata.req_to_vnode_offs,
+            metadata.req_to_vnode_lens,
+            metadata.mid_o,
+            metadata.mid_lse,
+            metadata.phase_node_nums,
+            metadata.phase_node_offsets,
+            metadata.phase_q_tile_sizes,
+            metadata.phase_kv_tile_sizes,
+            sm_scale,
         )
     
     # Benchmark
@@ -452,90 +583,64 @@ def main():
     num_iters = 20
     for _ in range(num_iters):
         fasttree_decode(
-            Q, K_tree, V_tree, O_fasttree, *metadata,
-            params.TSQs, params.TSKs, sm_scale
+            Q, cache.k_buffer, cache.v_buffer, O,
+            req_to_token,
+            metadata.vnode_to_kv_offs,
+            metadata.vnode_to_kv_lens,
+            metadata.vnode_to_q_entries,
+            metadata.vnode_to_q_offs,
+            metadata.vnode_to_q_lens,
+            metadata.req_to_vnode_entries,
+            metadata.req_to_vnode_offs,
+            metadata.req_to_vnode_lens,
+            metadata.mid_o,
+            metadata.mid_lse,
+            metadata.phase_node_nums,
+            metadata.phase_node_offsets,
+            metadata.phase_q_tile_sizes,
+            metadata.phase_kv_tile_sizes,
+            sm_scale,
         )
     torch.cuda.synchronize()
     elapsed = (time.perf_counter() - start) * 1000 / num_iters
-    
     print(f"FastTree decode: {elapsed:.3f} ms")
     
-    # ============================================================
-    # Validation (Optional)
-    # ============================================================
+    # Validation
     if args.validate:
         print(f"\n{'='*70}")
-        print("Validating against PyTorch reference...")
+        print("Validating...")
         print(f"{'='*70}")
         
-        # Build full K/V for each request
-        K_per_request = []
-        V_per_request = []
+        K_per_req, V_per_req = [], []
+        for node in tree_info:
+            if node.num_children == 0 and node.requests:
+                req_id = node.requests[0]
+                path = []
+                curr = node.id
+                while curr != -1:
+                    path.append(curr)
+                    curr = tree_info[curr].parent
+                path = path[::-1]
+                
+                K_full = torch.cat([K_node_data[n] for n in path], dim=0)
+                V_full = torch.cat([V_node_data[n] for n in path], dim=0)
+                K_per_req.append(K_full)
+                V_per_req.append(V_full)
         
-        for req_id in range(args.batch_size):
-            # Find path from leaf to root
-            leaf_id = None
-            for node in tree_info:
-                if node.num_children == 0 and req_id in node.requests:
-                    leaf_id = node.id
-                    break
-            
-            if leaf_id is None:
-                raise RuntimeError(f"Could not find leaf for request {req_id}")
-            
-            # Collect K/V along path
-            path = []
-            curr = leaf_id
-            while curr != -1:
-                path.append(curr)
-                curr = tree_info[curr].parent
-            path = path[::-1]  # Root to leaf order
-            
-            K_full = torch.cat([K_node_list[n] for n in path], dim=0)
-            V_full = torch.cat([V_node_list[n] for n in path], dim=0)
-            K_per_request.append(K_full)
-            V_per_request.append(V_full)
+        O_ref = pytorch_attention_reference(Q, K_per_req, V_per_req, sm_scale, args.num_qo_heads, args.num_kv_heads)
         
-        # Run reference
-        O_pytorch = pytorch_attention_reference(
-            Q, K_per_request, V_per_request, sm_scale,
-            args.num_qo_heads, args.num_kv_heads
-        )
-        
-        # Compare
-        max_abs_diff = (O_fasttree - O_pytorch).abs().max().item()
-        mean_abs_diff = (O_fasttree - O_pytorch).abs().mean().item()
-        
-        print(f"  Max absolute difference: {max_abs_diff:.6f}")
-        print(f"  Mean absolute difference: {mean_abs_diff:.6f}")
-        
-        rtol, atol = 1e-2, 1e-3
-        is_close = torch.allclose(O_fasttree, O_pytorch, rtol=rtol, atol=atol)
-        
-        if is_close:
-            print(f"  Result: ✓ PASS - Outputs match within tolerance")
-        else:
-            print(f"  Result: ✗ FAIL - Outputs differ beyond tolerance")
-            print(f"  Sample (request 0, head 0):")
-            print(f"    FastTree: {O_fasttree[0, 0, :5]}")
-            print(f"    PyTorch:  {O_pytorch[0, 0, :5]}")
+        max_diff = (O - O_ref).abs().max().item()
+        print(f"  Max diff: {max_diff:.6f}")
+        print(f"  Result: {'✓ PASS' if max_diff < 0.01 else '✗ FAIL'}")
     
-    # ============================================================
-    # Summary
-    # ============================================================
     print(f"\n{'='*70}")
-    print("Summary")
+    print("Summary: This example demonstrates efficient paged KV cache usage")
+    print("with FastTree using indirect indexing (no KV copy needed).")
     print(f"{'='*70}")
-    print(f"  Tree: {num_nodes} nodes, {total_tokens} tokens, {args.batch_size} requests")
-    print(f"  Paged cache: {args.max_num_pages} pages × {args.page_size} tokens/page")
-    print(f"  FastTree decode latency: {elapsed:.3f} ms")
-    print(f"\nThis example demonstrates using paged KV cache with FastTree,")
-    print(f"which is the standard format used in production LLM serving systems.")
 
 
 if __name__ == "__main__":
     if not torch.cuda.is_available():
-        print("ERROR: CUDA is not available")
+        print("ERROR: CUDA not available")
         sys.exit(1)
-    
     main()
