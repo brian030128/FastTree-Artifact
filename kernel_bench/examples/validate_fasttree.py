@@ -2,12 +2,26 @@
 Validate FastTree Against PyTorch Scaled Dot Product Attention
 
 Compares FastTree output with PyTorch's standard attention implementation
-to verify correctness using a 4-level binary tree structure.
+to verify correctness using tree-structured KV caches.
+
+Supports two tree types:
+1. Random imbalanced trees (default) - realistic structure with varying depths
+2. Balanced binary trees - symmetric structure for systematic testing
 
 Usage:
-    python validate_fasttree.py
-    python validate_fasttree.py --batch_size 8 --tokens_per_level 100,80,60,40
-    python validate_fasttree.py --batch_size 16 --tokens_per_level 150,100,75,50
+    # Random imbalanced tree (default)
+    python validate_fasttree.py --batch_size 10
+    python validate_fasttree.py --batch_size 15 --min_tokens 50 --max_tokens 200
+
+    # Balanced binary tree (batch_size must be power of 2)
+    python validate_fasttree.py --tree_type balanced --batch_size 8
+    python validate_fasttree.py --tree_type balanced --batch_size 16 --tokens_per_level 150,100,75,50
+
+    # With GQA
+    python validate_fasttree.py --batch_size 12 --num_qo_heads 32 --num_kv_heads 8
+
+    # Different random seeds
+    python validate_fasttree.py --batch_size 10 --seed 123
 """
 
 import sys
@@ -21,96 +35,237 @@ from fasttree import FastTreeParams, fasttree_preparation, fasttree_decode
 from kv_tree_simple import KVTreeNode
 
 
-def create_simple_tree(batch_size=8, tokens_per_level=[100, 80, 60, 40]):
+def create_random_imbalanced_tree(batch_size=8, min_tokens=20, max_tokens=150,
+                                   min_children=1, max_children=4, seed=None):
     """
-    Create a balanced 4-level tree structure.
+    Create a random imbalanced tree structure.
 
-    Structure:
-        Level 0: Root (tokens_per_level[0])
-                    |
-        Level 1: 2 nodes (tokens_per_level[1] each)
-                /        \
-        Level 2: 4 nodes (tokens_per_level[2] each, 2 children of each L1 node)
-              /  |  |  \
-        Level 3: 8 leaves (tokens_per_level[3] each, 2 children of each L2 node)
+    This creates a more realistic tree where:
+    - Different branches have different depths
+    - Nodes can have varying numbers of children (1 to max_children)
+    - Leaf nodes can be at different levels
+    - Token counts vary randomly between min_tokens and max_tokens
 
-    This creates a binary tree with depth=4 and 8 leaf nodes (requests).
+    Args:
+        batch_size: Number of leaf nodes (requests)
+        min_tokens: Minimum tokens per node
+        max_tokens: Maximum tokens per node
+        min_children: Minimum children per non-leaf node
+        max_children: Maximum children per non-leaf node
+        seed: Random seed for reproducibility
+
+    Returns:
+        tree_info: List of KVTreeNode objects
+    """
+    import random
+
+    if seed is not None:
+        random.seed(seed)
+
+    tree_info = []
+    node_id = 0
+    leaves_created = 0
+
+    # Create root
+    root = KVTreeNode()
+    root.parent = -1
+    root.id = node_id
+    root.seqlen = random.randint(min_tokens, max_tokens)
+    root.num_children = 0  # Will be updated
+    root.requests = []  # Will be filled later
+    tree_info.append(root)
+    node_id += 1
+
+    # Queue of nodes that need children: (node_id, depth)
+    nodes_to_expand = [(0, 0)]
+
+    # Keep track of leaf nodes
+    leaf_nodes = []
+
+    while leaves_created < batch_size:
+        if not nodes_to_expand:
+            # No more nodes to expand, but need more leaves
+            # Pick a random leaf and make it internal
+            if leaf_nodes:
+                parent_id = random.choice(leaf_nodes)
+                leaf_nodes.remove(parent_id)
+                nodes_to_expand.append((parent_id, -1))  # Depth doesn't matter here
+            else:
+                break
+
+        parent_id, depth = nodes_to_expand.pop(0)
+
+        # Decide how many children this node should have
+        # Bias towards fewer children as we approach the target
+        remaining = batch_size - leaves_created
+        if remaining <= 1:
+            num_children = 1
+        else:
+            # Random number of children, but not more than remaining leaves needed
+            num_children = random.randint(min_children, min(max_children, remaining))
+
+        tree_info[parent_id].num_children = num_children
+
+        # Create children
+        for i in range(num_children):
+            child = KVTreeNode()
+            child.parent = parent_id
+            child.id = node_id
+            child.seqlen = random.randint(min_tokens, max_tokens)
+            child.num_children = 0  # May be updated later
+            child.requests = []  # Will be filled later
+            tree_info.append(child)
+
+            # Decide if this child should be a leaf or have children
+            # Use probability that decreases with depth to avoid too deep trees
+            remaining_after_this = batch_size - leaves_created - 1
+
+            if remaining_after_this <= 0:
+                # Must be a leaf (we've reached our quota)
+                leaf_nodes.append(node_id)
+                leaves_created += 1
+            else:
+                # Random decision: be a leaf or expand further
+                # Probability of being a leaf increases as we get closer to batch_size
+                leaf_probability = 0.3 + 0.5 * (leaves_created / batch_size)
+
+                # Also increase probability with depth
+                leaf_probability += depth * 0.1
+                leaf_probability = min(0.9, leaf_probability)
+
+                if random.random() < leaf_probability or depth >= 10:
+                    # Make it a leaf
+                    leaf_nodes.append(node_id)
+                    leaves_created += 1
+                else:
+                    # Will expand this node later
+                    nodes_to_expand.append((node_id, depth + 1))
+
+            node_id += 1
+
+    # Assign requests to leaf nodes
+    request_id = 0
+    for leaf_id in leaf_nodes:
+        tree_info[leaf_id].requests = [request_id]
+        request_id += 1
+
+    # Propagate requests up the tree
+    for leaf_id in leaf_nodes:
+        node_id = leaf_id
+        while node_id != -1:
+            parent_id = tree_info[node_id].parent
+            if parent_id != -1:
+                # Add this leaf's requests to parent
+                for req in tree_info[leaf_id].requests:
+                    if req not in tree_info[parent_id].requests:
+                        tree_info[parent_id].requests.append(req)
+            node_id = parent_id
+
+    # Sort requests for consistency
+    for node in tree_info:
+        node.requests.sort()
+
+    return tree_info
+
+
+def create_balanced_tree(batch_size=8, tokens_per_level=[100, 80, 60, 40]):
+    """
+    Create a balanced binary tree structure.
+
+    The tree depth is automatically determined by batch_size:
+    - batch_size must be a power of 2
+    - depth = log2(batch_size) + 1
+    - Number of leaf nodes = batch_size
+
+    Example for batch_size=8 (depth=4):
+        Level 0: Root (1 node)
+        Level 1: 2 nodes
+        Level 2: 4 nodes
+        Level 3: 8 leaves
+
+    Example for batch_size=16 (depth=5):
+        Level 0: Root (1 node)
+        Level 1: 2 nodes
+        Level 2: 4 nodes
+        Level 3: 8 nodes
+        Level 4: 16 leaves
 
     Args:
         batch_size: Number of leaf nodes (requests). Must be a power of 2.
-        tokens_per_level: List of token counts for each level [L0, L1, L2, L3]
+        tokens_per_level: List of token counts for each level
     """
     import math
 
     # Verify batch_size is power of 2
-    depth = int(math.log2(batch_size)) + 1
-    if 2 ** (depth - 1) != batch_size:
+    if batch_size & (batch_size - 1) != 0 or batch_size == 0:
         raise ValueError(f"batch_size must be a power of 2, got {batch_size}")
 
-    # Ensure we have enough levels
+    # Calculate depth: depth = log2(batch_size) + 1
+    # e.g., batch_size=8 -> depth=4, batch_size=16 -> depth=5
+    depth = int(math.log2(batch_size)) + 1
+
+    # Extend tokens_per_level if needed
     while len(tokens_per_level) < depth:
         tokens_per_level.append(tokens_per_level[-1])
 
     tree_info = []
     node_id = 0
 
+    # Build tree level by level
+    current_level_nodes = []  # Stores node IDs for current level
+
     # Level 0: Root
     root = KVTreeNode()
     root.parent = -1
     root.id = node_id
     root.seqlen = tokens_per_level[0]
-    root.num_children = 2
+    root.num_children = 2 if depth > 1 else 0
     root.requests = list(range(batch_size))
     tree_info.append(root)
+    current_level_nodes = [node_id]
     node_id += 1
 
-    # Level 1: 2 nodes
-    level1_nodes = []
-    for i in range(2):
-        node = KVTreeNode()
-        node.parent = 0
-        node.id = node_id
-        node.seqlen = tokens_per_level[1]
-        node.num_children = 2
-        # Assign half the requests to each L1 node
-        start_req = i * (batch_size // 2)
-        end_req = (i + 1) * (batch_size // 2)
-        node.requests = list(range(start_req, end_req))
-        tree_info.append(node)
-        level1_nodes.append(node_id)
-        node_id += 1
+    # Build intermediate levels (level 1 to depth-2)
+    for level in range(1, depth - 1):
+        next_level_nodes = []
+        nodes_at_this_level = 2 ** level
+        reqs_per_node = batch_size // nodes_at_this_level
 
-    # Level 2: 4 nodes (2 children for each L1 node)
-    level2_nodes = []
-    for l1_idx, l1_id in enumerate(level1_nodes):
-        for i in range(2):
-            node = KVTreeNode()
-            node.parent = l1_id
-            node.id = node_id
-            node.seqlen = tokens_per_level[2]
-            node.num_children = 2
-            # Each L2 node gets quarter of requests
-            reqs_per_l2 = batch_size // 4
-            start_req = l1_idx * (batch_size // 2) + i * reqs_per_l2
-            end_req = start_req + reqs_per_l2
-            node.requests = list(range(start_req, end_req))
-            tree_info.append(node)
-            level2_nodes.append(node_id)
-            node_id += 1
+        for idx, parent_id in enumerate(current_level_nodes):
+            # Each node at previous level has 2 children
+            for child_idx in range(2):
+                node = KVTreeNode()
+                node.parent = parent_id
+                node.id = node_id
+                node.seqlen = tokens_per_level[level]
+                node.num_children = 2  # Not a leaf yet
 
-    # Level 3: 8 leaf nodes (2 children for each L2 node)
-    request_id = 0
-    for l2_idx, l2_id in enumerate(level2_nodes):
-        for i in range(2):
-            node = KVTreeNode()
-            node.parent = l2_id
-            node.id = node_id
-            node.seqlen = tokens_per_level[3]
-            node.num_children = 0  # Leaf
-            node.requests = [request_id]
-            tree_info.append(node)
-            node_id += 1
-            request_id += 1
+                # Calculate which requests pass through this node
+                node_index = idx * 2 + child_idx
+                start_req = node_index * reqs_per_node
+                end_req = start_req + reqs_per_node
+                node.requests = list(range(start_req, end_req))
+
+                tree_info.append(node)
+                next_level_nodes.append(node_id)
+                node_id += 1
+
+        current_level_nodes = next_level_nodes
+
+    # Build leaf level (level depth-1)
+    if depth > 1:
+        request_id = 0
+        for parent_id in current_level_nodes:
+            for child_idx in range(2):
+                node = KVTreeNode()
+                node.parent = parent_id
+                node.id = node_id
+                node.seqlen = tokens_per_level[depth - 1]
+                node.num_children = 0  # Leaf
+                node.requests = [request_id]
+                tree_info.append(node)
+                node_id += 1
+                request_id += 1
 
     return tree_info
 
@@ -237,52 +392,123 @@ def compare_outputs(fasttree_out, pytorch_out, rtol=1e-2, atol=1e-3):
 def main():
     parser = argparse.ArgumentParser(description='Validate FastTree against PyTorch')
     parser.add_argument('--batch_size', type=int, default=8,
-                        help='Number of requests (must be power of 2 for 4-level tree)')
+                        help='Number of requests (leaf nodes)')
+    parser.add_argument('--tree_type', type=str, default='random', choices=['random', 'balanced'],
+                        help='Tree structure type: random (imbalanced) or balanced')
+
+    # For balanced trees
     parser.add_argument('--tokens_per_level', type=str, default='100,80,60,40',
-                        help='Comma-separated tokens per level [L0,L1,L2,L3]')
+                        help='Comma-separated tokens per level for balanced trees')
+
+    # For random trees
+    parser.add_argument('--min_tokens', type=int, default=20,
+                        help='Minimum tokens per node for random trees')
+    parser.add_argument('--max_tokens', type=int, default=150,
+                        help='Maximum tokens per node for random trees')
+    parser.add_argument('--min_children', type=int, default=1,
+                        help='Minimum children per node for random trees')
+    parser.add_argument('--max_children', type=int, default=4,
+                        help='Maximum children per node for random trees')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for reproducibility')
+
+    # Model configuration
     parser.add_argument('--num_qo_heads', type=int, default=32, help='Number of Q/O heads')
     parser.add_argument('--num_kv_heads', type=int, default=32, help='Number of K/V heads')
     parser.add_argument('--head_dim', type=int, default=128, help='Head dimension')
+
+    # Validation
     parser.add_argument('--rtol', type=float, default=1e-2, help='Relative tolerance')
     parser.add_argument('--atol', type=float, default=1e-3, help='Absolute tolerance')
     args = parser.parse_args()
 
     print("=" * 70)
-    print("FastTree Validation Against PyTorch (4-Level Tree)")
+    print(f"FastTree Validation Against PyTorch ({args.tree_type.capitalize()} Tree)")
     print("=" * 70)
 
     # Configuration
     batch_size = args.batch_size
-    tokens_per_level = list(map(int, args.tokens_per_level.split(',')))
     num_qo_heads = args.num_qo_heads
     num_kv_heads = args.num_kv_heads
     head_dim = args.head_dim
     device = "cuda"
     dtype = torch.float16
 
-    # Calculate total sequence length (sum of all levels)
-    total_seqlen = sum(tokens_per_level)
-
     print(f"\nConfiguration:")
     print(f"  Batch size: {batch_size} requests")
-    print(f"  Tree structure: 4-level binary tree")
-    print(f"    Level 0 (root): {tokens_per_level[0]} tokens")
-    print(f"    Level 1: {tokens_per_level[1]} tokens (2 nodes)")
-    print(f"    Level 2: {tokens_per_level[2]} tokens (4 nodes)")
-    print(f"    Level 3 (leaves): {tokens_per_level[3]} tokens (8 nodes)")
-    print(f"  Total sequence length per request: {total_seqlen}")
+    print(f"  Tree type: {args.tree_type}")
     print(f"  Q/O heads: {num_qo_heads}")
     print(f"  K/V heads: {num_kv_heads}")
     print(f"  GQA ratio: {num_qo_heads // num_kv_heads}")
     print(f"  Head dim: {head_dim}")
 
-    # Create tree
-    tree_info = create_simple_tree(batch_size, tokens_per_level)
-    print(f"\nTree: {len(tree_info)} nodes, {batch_size} requests")
-    print(f"  Level 0: 1 node (root)")
-    print(f"  Level 1: 2 nodes")
-    print(f"  Level 2: 4 nodes")
-    print(f"  Level 3: 8 leaf nodes")
+    # Create tree based on type
+    if args.tree_type == 'balanced':
+        tokens_per_level = list(map(int, args.tokens_per_level.split(',')))
+        print(f"  Tokens per level: {tokens_per_level}")
+        tree_info = create_balanced_tree(batch_size, tokens_per_level)
+    else:  # random
+        print(f"  Token range: [{args.min_tokens}, {args.max_tokens}]")
+        print(f"  Children range: [{args.min_children}, {args.max_children}]")
+        print(f"  Random seed: {args.seed}")
+        tree_info = create_random_imbalanced_tree(
+            batch_size, args.min_tokens, args.max_tokens,
+            args.min_children, args.max_children, args.seed
+        )
+
+    # Analyze tree structure
+    def analyze_tree(tree_info):
+        """Analyze tree characteristics"""
+        num_nodes = len(tree_info)
+        num_leaves = sum(1 for node in tree_info if node.num_children == 0)
+
+        # Calculate depths for each leaf
+        leaf_depths = []
+        for node in tree_info:
+            if node.num_children == 0:
+                depth = 0
+                curr_id = node.id
+                while tree_info[curr_id].parent != -1:
+                    depth += 1
+                    curr_id = tree_info[curr_id].parent
+                leaf_depths.append(depth)
+
+        # Calculate path lengths (tokens) for each request
+        path_lengths = []
+        for req_id in range(num_leaves):
+            # Find leaf for this request
+            leaf_id = None
+            for node in tree_info:
+                if node.num_children == 0 and req_id in node.requests:
+                    leaf_id = node.id
+                    break
+
+            # Sum tokens along path
+            total_tokens = 0
+            curr_id = leaf_id
+            while curr_id != -1:
+                total_tokens += tree_info[curr_id].seqlen
+                curr_id = tree_info[curr_id].parent
+            path_lengths.append(total_tokens)
+
+        return {
+            'num_nodes': num_nodes,
+            'num_leaves': num_leaves,
+            'min_depth': min(leaf_depths),
+            'max_depth': max(leaf_depths),
+            'avg_depth': sum(leaf_depths) / len(leaf_depths),
+            'min_path_len': min(path_lengths),
+            'max_path_len': max(path_lengths),
+            'avg_path_len': sum(path_lengths) / len(path_lengths),
+        }
+
+    stats = analyze_tree(tree_info)
+
+    print(f"\nTree Statistics:")
+    print(f"  Total nodes: {stats['num_nodes']}")
+    print(f"  Leaf nodes: {stats['num_leaves']}")
+    print(f"  Tree depth: min={stats['min_depth']}, max={stats['max_depth']}, avg={stats['avg_depth']:.1f}")
+    print(f"  Path length (tokens): min={stats['min_path_len']}, max={stats['max_path_len']}, avg={stats['avg_path_len']:.1f}")
 
     # Prepare data
     K_tree, V_tree, KV_ptrs, K_tree_list, V_tree_list = prepare_kv_data_for_tree(
