@@ -2,11 +2,12 @@
 Validate FastTree Against PyTorch Scaled Dot Product Attention
 
 Compares FastTree output with PyTorch's standard attention implementation
-to verify correctness.
+to verify correctness using a 4-level binary tree structure.
 
 Usage:
     python validate_fasttree.py
-    python validate_fasttree.py --batch_size 4 --seq_len 512
+    python validate_fasttree.py --batch_size 8 --tokens_per_level 100,80,60,40
+    python validate_fasttree.py --batch_size 16 --tokens_per_level 150,100,75,50
 """
 
 import sys
@@ -20,35 +21,96 @@ from fasttree import FastTreeParams, fasttree_preparation, fasttree_decode
 from kv_tree_simple import KVTreeNode
 
 
-def create_simple_tree(batch_size=2, prefix_len=128, suffix_len=64):
+def create_simple_tree(batch_size=8, tokens_per_level=[100, 80, 60, 40]):
     """
-    Create a tree with shared prefix and separate suffixes for each request.
+    Create a balanced 4-level tree structure.
 
     Structure:
-        Root (prefix_len tokens, shared by all)
-        /    |    |    \
-     Req0  Req1 Req2  ... (suffix_len tokens each)
-    """
-    tree_info = []
+        Level 0: Root (tokens_per_level[0])
+                    |
+        Level 1: 2 nodes (tokens_per_level[1] each)
+                /        \
+        Level 2: 4 nodes (tokens_per_level[2] each, 2 children of each L1 node)
+              /  |  |  \
+        Level 3: 8 leaves (tokens_per_level[3] each, 2 children of each L2 node)
 
-    # Root: shared prefix
+    This creates a binary tree with depth=4 and 8 leaf nodes (requests).
+
+    Args:
+        batch_size: Number of leaf nodes (requests). Must be a power of 2.
+        tokens_per_level: List of token counts for each level [L0, L1, L2, L3]
+    """
+    import math
+
+    # Verify batch_size is power of 2
+    depth = int(math.log2(batch_size)) + 1
+    if 2 ** (depth - 1) != batch_size:
+        raise ValueError(f"batch_size must be a power of 2, got {batch_size}")
+
+    # Ensure we have enough levels
+    while len(tokens_per_level) < depth:
+        tokens_per_level.append(tokens_per_level[-1])
+
+    tree_info = []
+    node_id = 0
+
+    # Level 0: Root
     root = KVTreeNode()
     root.parent = -1
-    root.id = 0
-    root.seqlen = prefix_len
-    root.num_children = batch_size
+    root.id = node_id
+    root.seqlen = tokens_per_level[0]
+    root.num_children = 2
     root.requests = list(range(batch_size))
     tree_info.append(root)
+    node_id += 1
 
-    # Children: one per request
-    for i in range(batch_size):
-        child = KVTreeNode()
-        child.parent = 0
-        child.id = i + 1
-        child.seqlen = suffix_len
-        child.num_children = 0
-        child.requests = [i]
-        tree_info.append(child)
+    # Level 1: 2 nodes
+    level1_nodes = []
+    for i in range(2):
+        node = KVTreeNode()
+        node.parent = 0
+        node.id = node_id
+        node.seqlen = tokens_per_level[1]
+        node.num_children = 2
+        # Assign half the requests to each L1 node
+        start_req = i * (batch_size // 2)
+        end_req = (i + 1) * (batch_size // 2)
+        node.requests = list(range(start_req, end_req))
+        tree_info.append(node)
+        level1_nodes.append(node_id)
+        node_id += 1
+
+    # Level 2: 4 nodes (2 children for each L1 node)
+    level2_nodes = []
+    for l1_idx, l1_id in enumerate(level1_nodes):
+        for i in range(2):
+            node = KVTreeNode()
+            node.parent = l1_id
+            node.id = node_id
+            node.seqlen = tokens_per_level[2]
+            node.num_children = 2
+            # Each L2 node gets quarter of requests
+            reqs_per_l2 = batch_size // 4
+            start_req = l1_idx * (batch_size // 2) + i * reqs_per_l2
+            end_req = start_req + reqs_per_l2
+            node.requests = list(range(start_req, end_req))
+            tree_info.append(node)
+            level2_nodes.append(node_id)
+            node_id += 1
+
+    # Level 3: 8 leaf nodes (2 children for each L2 node)
+    request_id = 0
+    for l2_idx, l2_id in enumerate(level2_nodes):
+        for i in range(2):
+            node = KVTreeNode()
+            node.parent = l2_id
+            node.id = node_id
+            node.seqlen = tokens_per_level[3]
+            node.num_children = 0  # Leaf
+            node.requests = [request_id]
+            tree_info.append(node)
+            node_id += 1
+            request_id += 1
 
     return tree_info
 
@@ -174,9 +236,10 @@ def compare_outputs(fasttree_out, pytorch_out, rtol=1e-2, atol=1e-3):
 
 def main():
     parser = argparse.ArgumentParser(description='Validate FastTree against PyTorch')
-    parser.add_argument('--batch_size', type=int, default=2, help='Number of requests')
-    parser.add_argument('--prefix_len', type=int, default=128, help='Shared prefix length')
-    parser.add_argument('--suffix_len', type=int, default=64, help='Per-request suffix length')
+    parser.add_argument('--batch_size', type=int, default=8,
+                        help='Number of requests (must be power of 2 for 4-level tree)')
+    parser.add_argument('--tokens_per_level', type=str, default='100,80,60,40',
+                        help='Comma-separated tokens per level [L0,L1,L2,L3]')
     parser.add_argument('--num_qo_heads', type=int, default=32, help='Number of Q/O heads')
     parser.add_argument('--num_kv_heads', type=int, default=32, help='Number of K/V heads')
     parser.add_argument('--head_dim', type=int, default=128, help='Head dimension')
@@ -185,32 +248,41 @@ def main():
     args = parser.parse_args()
 
     print("=" * 70)
-    print("FastTree Validation Against PyTorch")
+    print("FastTree Validation Against PyTorch (4-Level Tree)")
     print("=" * 70)
 
     # Configuration
     batch_size = args.batch_size
-    prefix_len = args.prefix_len
-    suffix_len = args.suffix_len
+    tokens_per_level = list(map(int, args.tokens_per_level.split(',')))
     num_qo_heads = args.num_qo_heads
     num_kv_heads = args.num_kv_heads
     head_dim = args.head_dim
     device = "cuda"
     dtype = torch.float16
 
+    # Calculate total sequence length (sum of all levels)
+    total_seqlen = sum(tokens_per_level)
+
     print(f"\nConfiguration:")
-    print(f"  Batch size: {batch_size}")
-    print(f"  Prefix length: {prefix_len} (shared)")
-    print(f"  Suffix length: {suffix_len} (per request)")
-    print(f"  Total sequence length: {prefix_len + suffix_len}")
+    print(f"  Batch size: {batch_size} requests")
+    print(f"  Tree structure: 4-level binary tree")
+    print(f"    Level 0 (root): {tokens_per_level[0]} tokens")
+    print(f"    Level 1: {tokens_per_level[1]} tokens (2 nodes)")
+    print(f"    Level 2: {tokens_per_level[2]} tokens (4 nodes)")
+    print(f"    Level 3 (leaves): {tokens_per_level[3]} tokens (8 nodes)")
+    print(f"  Total sequence length per request: {total_seqlen}")
     print(f"  Q/O heads: {num_qo_heads}")
     print(f"  K/V heads: {num_kv_heads}")
     print(f"  GQA ratio: {num_qo_heads // num_kv_heads}")
     print(f"  Head dim: {head_dim}")
 
     # Create tree
-    tree_info = create_simple_tree(batch_size, prefix_len, suffix_len)
+    tree_info = create_simple_tree(batch_size, tokens_per_level)
     print(f"\nTree: {len(tree_info)} nodes, {batch_size} requests")
+    print(f"  Level 0: 1 node (root)")
+    print(f"  Level 1: 2 nodes")
+    print(f"  Level 2: 4 nodes")
+    print(f"  Level 3: 8 leaf nodes")
 
     # Prepare data
     K_tree, V_tree, KV_ptrs, K_tree_list, V_tree_list = prepare_kv_data_for_tree(
