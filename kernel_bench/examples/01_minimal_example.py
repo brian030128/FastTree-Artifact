@@ -183,14 +183,14 @@ def main():
     sm_scale = 1.0 / (head_dim ** 0.5)  # Softmax scaling factor
 
     fasttree_decode(
-        q=Q,
-        k_buffer=K_tree_tensor,
-        v_buffer=V_tree_tensor,
-        o=O,
-        *metadata,  # Unpack 13 metadata tensors from preparation
-        phase_q_tile_sizes=params.TSQs,
-        phase_kv_tile_sizes=params.TSKs,
-        sm_scale=sm_scale,
+        Q,              # q (positional)
+        K_tree_tensor,  # k_buffer (positional)
+        V_tree_tensor,  # v_buffer (positional)
+        O,              # o (positional)
+        *metadata,      # Unpack 13 metadata tensors from preparation
+        params.TSQs,    # phase_q_tile_sizes (positional)
+        params.TSKs,    # phase_kv_tile_sizes (positional)
+        sm_scale,       # sm_scale (positional)
     )
     print("Decode completed")
 

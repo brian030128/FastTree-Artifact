@@ -262,14 +262,14 @@ def main():
     # Define decode function
     def decode_func():
         fasttree_decode(
-            q=Q,
-            k_buffer=K_tree_tensor,
-            v_buffer=V_tree_tensor,
-            o=O,
-            *metadata,
-            phase_q_tile_sizes=params.TSQs,
-            phase_kv_tile_sizes=params.TSKs,
-            sm_scale=sm_scale,
+            Q,              # q (positional)
+            K_tree_tensor,  # k_buffer (positional)
+            V_tree_tensor,  # v_buffer (positional)
+            O,              # o (positional)
+            *metadata,      # Unpack 13 metadata tensors
+            params.TSQs,    # phase_q_tile_sizes (positional)
+            params.TSKs,    # phase_kv_tile_sizes (positional)
+            sm_scale,       # sm_scale (positional)
         )
 
     # Benchmark
