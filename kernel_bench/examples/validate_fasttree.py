@@ -143,23 +143,34 @@ def create_random_imbalanced_tree(batch_size=8, min_tokens=20, max_tokens=150,
 
             node_id += 1
 
+    # Find all actual leaf nodes (num_children == 0)
+    actual_leaves = [node.id for node in tree_info if node.num_children == 0]
+
+    # Ensure we have exactly batch_size leaves
+    if len(actual_leaves) < batch_size:
+        print(f"Warning: Only created {len(actual_leaves)} leaves, needed {batch_size}")
+        # Pad by duplicating some leaves
+        while len(actual_leaves) < batch_size:
+            actual_leaves.append(actual_leaves[len(actual_leaves) % len(actual_leaves)])
+    elif len(actual_leaves) > batch_size:
+        # Take first batch_size leaves
+        actual_leaves = actual_leaves[:batch_size]
+
     # Assign requests to leaf nodes
-    request_id = 0
-    for leaf_id in leaf_nodes:
+    for request_id, leaf_id in enumerate(actual_leaves):
         tree_info[leaf_id].requests = [request_id]
-        request_id += 1
 
     # Propagate requests up the tree
-    for leaf_id in leaf_nodes:
-        node_id = leaf_id
-        while node_id != -1:
-            parent_id = tree_info[node_id].parent
+    for leaf_id in actual_leaves:
+        curr_id = leaf_id
+        request_id = tree_info[leaf_id].requests[0]
+        while curr_id != -1:
+            parent_id = tree_info[curr_id].parent
             if parent_id != -1:
-                # Add this leaf's requests to parent
-                for req in tree_info[leaf_id].requests:
-                    if req not in tree_info[parent_id].requests:
-                        tree_info[parent_id].requests.append(req)
-            node_id = parent_id
+                # Add this request to parent
+                if request_id not in tree_info[parent_id].requests:
+                    tree_info[parent_id].requests.append(request_id)
+            curr_id = parent_id
 
     # Sort requests for consistency
     for node in tree_info:
@@ -299,10 +310,18 @@ def build_full_kv_for_request(tree_info, K_tree_list, V_tree_list, request_id):
             leaf_id = node.id
             break
 
+    if leaf_id is None:
+        raise ValueError(f"Could not find leaf node for request {request_id}. "
+                        f"Available leaves: {[n.id for n in tree_info if n.num_children == 0]}")
+
     # Traverse from leaf to root, collecting nodes
     path = []
     node_id = leaf_id
-    while node_id != -1:
+    visited = set()
+    while node_id is not None and node_id != -1:
+        if node_id in visited:
+            raise ValueError(f"Cycle detected in tree at node {node_id}")
+        visited.add(node_id)
         path.append(node_id)
         node_id = tree_info[node_id].parent
     path.reverse()  # Root to leaf order
